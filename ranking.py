@@ -109,6 +109,20 @@ def rank_elements(elements: list[dict[str, Any]], goal: str, action_type: str) -
         type_score = _type_match_score(str(element.get("type", "")), goal, action_type)
         position_score = _position_score(element, screen_w, screen_h, goal, action_type)
         cluster_score = _cluster_score(idx, elements)
+        
+        # Add CENTER region bias: prioritize center-screen elements
+        center_bias = 0.0
+        region = str(element.get("region", "")).lower()
+        if region == "center":
+            center_bias = 0.15  # Boost for center region
+        
+        # Wide boxes in CENTER region are likely inputs/search bars
+        bbox = element.get("bbox", [0, 0, 0, 0])
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        width = x2 - x1
+        height = max(1, y2 - y1)
+        if region == "center" and width / height > 2.5:
+            center_bias += 0.15  # Extra boost for wide center elements
 
         score = (
             0.30 * confidence
@@ -116,7 +130,7 @@ def rank_elements(elements: list[dict[str, Any]], goal: str, action_type: str) -
             + 0.25 * type_score
             + 0.15 * position_score
             + 0.10 * cluster_score
-        )
+        ) + center_bias
 
         ranked.append(
             RankedElement(
@@ -128,6 +142,7 @@ def rank_elements(elements: list[dict[str, Any]], goal: str, action_type: str) -
                     "type_match": type_score,
                     "position": position_score,
                     "cluster": cluster_score,
+                    "center_bias": center_bias,
                 },
             )
         )

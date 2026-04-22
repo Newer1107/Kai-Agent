@@ -56,6 +56,7 @@ class LocalAssistant:
                 ui_elements=payload.ui_elements,
                 current_goal=goal,
                 last_action=get_last_action(),
+                screen_size=(payload.original_size[0], payload.original_size[1]),
             )
             action = self._enforce_runtime_safety(action)
 
@@ -76,7 +77,12 @@ class LocalAssistant:
                 "resolution_reason": None,
             }
 
-            action = self._ground_action_with_vision(action, payload.ui_elements, payload.image)
+            action = self._ground_action_with_vision(
+                action,
+                payload.ui_elements,
+                payload.image,
+                payload.original_size,
+            )
 
             return self._validate_or_downgrade_coordinates(action)
         except DetectorError as exc:
@@ -100,6 +106,7 @@ class LocalAssistant:
         action: UIAction,
         detections: list[dict[str, Any]],
         image,
+        original_size: tuple[int, int],
     ) -> UIAction:
         if action.action == ActionEnum.WAIT:
             return action
@@ -125,7 +132,7 @@ class LocalAssistant:
             action_type=action.action.value,
             min_confidence=self.DETECTION_MIN_CONFIDENCE,
             ambiguity_margin=self.DETECTION_AMBIGUITY_MARGIN,
-            screen_size=(payload.original_size[0], payload.original_size[1]),
+            screen_size=(original_size[0], original_size[1]),
         )
         self._coordinate_debug["resolution_reason"] = resolved.reason
 

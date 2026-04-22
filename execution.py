@@ -5,6 +5,7 @@ from typing import Any, Optional, Tuple
 import pyautogui
 
 from schema import ActionEnum, UIAction
+from policy import get_action_risk, get_min_confidence_for_action, is_intent_clear
 
 try:
     import win32api
@@ -99,7 +100,7 @@ def resolve_action_coordinates(
     selected_element: Optional[dict[str, Any]] = None,
     min_confidence: float = 0.5,
 ) -> Optional[Tuple[int, int]]:
-    """Resolve execution coordinates from selected element center only."""
+    """Resolve execution coordinates using risk-based confidence policy."""
     if not selected_element:
         print("Execution skipped: no selected UI element was provided.")
         return None
@@ -111,8 +112,14 @@ def resolve_action_coordinates(
     confidence = float(selected_element.get("confidence", 0.0))
     source = str(selected_element.get("source", "yolo"))
     
-    # Relax confidence check for heuristic-sourced elements
-    actual_min_confidence = min_confidence if source == "yolo" else max(0.25, min_confidence - 0.15)
+    # Use RISK-BASED policy instead of flat 0.5 threshold
+    actual_min_confidence = get_min_confidence_for_action(
+        action=action.action.value,
+        source=source,
+        goal="",  # Goal not available at this layer, use default policy
+    )
+    
+    print(f"[EXEC POLICY] Action: {action.action.value} | Risk: {get_action_risk(action.action.value)} | Confidence: {confidence:.2f} | Min required: {actual_min_confidence:.2f} | Source: {source}")
     
     if confidence < actual_min_confidence:
         print(

@@ -36,21 +36,21 @@ Default local model:
 The current implementation enforces:
 
 1. Strict structured output (`UIAction`) with schema validation
-2. Invalid model output retries once, then safe fallback to `wait`
-3. If `confidence_score < 0.6`, action is forced to `wait` (relaxed to >= 0.3 for input fields when goal is clear)
-4. If action is non-`wait` and coordinates are missing, action is forced to `wait`
-5. If coordinates are out of bounds, action is forced to `wait`
-6. If action is `wait`, nothing is executed
-7. User approval is required before every executable action
-8. Trigger lock prevents overlapping runs
-9. Main loop catches exceptions so one failure does not crash the assistant
-10. Actions are only executed after explicit chat approval (`Approve` or `/approve`)
-11. Execution coordinates are grounded from YOLO detection centers or heuristic fallback centers in full-screen space
-12. Process DPI awareness is enabled at startup to avoid logical-vs-physical pixel mismatch
-13. Blind clicks are blocked when YOLO cannot confidently match the target label, but heuristics allow reasonable inference
-14. Ambiguous targets are rejected before execution and downgraded to `wait`
-15. Heuristic fallbacks (shape-based, goal-aware) are used when YOLO detection fails or confidence is marginal
-16. All heuristic placements are validated to be in safe UI zones (not near edges, not in taskbar)
+2. **RISK-BASED EXECUTION POLICY**: Confidence thresholds vary by action type (type=0.3, click=0.4-0.5, scroll=0.7)
+3. **REMOVED GLOBAL BLOCK**: No more blanket "confidence < 0.6 → wait" rule
+4. **HEURISTIC SOURCES ALWAYS ALLOWED**: Elements from heuristic fallbacks execute with min confidence 0.25
+5. **EMERGENCY FALLBACK**: If LLM fails entirely, use heuristic_action_fallback() with 0.65 confidence
+6. If action is non-`wait` and coordinates are missing, action is forced to `wait`
+7. If coordinates are out of bounds, action is forced to `wait`
+8. If action is `wait`, nothing is executed
+9. User approval is required before every executable action
+10. Trigger lock prevents overlapping runs
+11. Main loop catches exceptions so one failure does not crash the assistant
+12. Actions are only executed after explicit chat approval (`Approve` or `/approve`)
+13. **HARD RULE**: System NEVER returns `wait` if goal is clear AND screen contains UI elements (uses heuristic fallback instead)
+14. Execution coordinates are grounded from YOLO detection centers or heuristic fallback centers in full-screen space
+15. Process DPI awareness is enabled at startup to avoid logical-vs-physical pixel mismatch
+16. **USABILITY OVER PERFECTION**: Typing in a wrong field is acceptable; doing nothing is not
 
 ## Project Structure
 
@@ -86,8 +86,11 @@ The current implementation enforces:
   - Accepts image, `ui_elements`, optional `current_goal`, and optional `last_action`
   - Prompts for exactly one cautious next step and `target_label` using type + region + semantics
   - Allows approximate target inference when goal strongly suggests intent
+  - **EMERGENCY FALLBACK**: If LLM fails (InstructorRetryException or network error), activates `heuristic_action_fallback()` to force action
+  - Safety overrides relaxed when goal is clear: allows low-confidence actions if intent is explicit
   - Does not rely on LLM coordinates
-  - Applies safety overrides and a JSON fallback parser for robust outputs
+  - Applies goal-aware safety overrides and JSON fallback parser for robust outputs
+  - Debug logging with `[REASONING]`, `[FALLBACK]`, `[SAFETY]` prefixes
 
 - `heuristics.py`
   - Provides fallback detection when YOLO fails or detections are low-confidence
@@ -98,6 +101,18 @@ The current implementation enforces:
     - `is_safe_heuristic_location(element, screen_width, screen_height)`: Validates heuristic element center is in safe UI zone (not edges, not taskbar)
   - All heuristics tag elements with `source: "heuristic_*"` for tracking and relaxed confidence checks
 
+- `policy.py`
+  - **NEW**: Risk-based execution policy replacing global confidence blocks
+  - Functions:
+    - `get_action_risk(action)`: Classifies action as low/medium/high risk (type=low, click=medium, scroll=high)
+    - `is_intent_clear(goal)`: Detects explicit user intent from goal keywords
+    - `get_min_confidence_for_action(action, source, goal)`: Returns required confidence threshold based on risk profile
+    - `is_action_allowed(action, confidence, source, goal)`: Determines if action should execute
+  - Risk-based thresholds: type >= 0.3 (low risk), click >= 0.4-0.5 (medium), scroll >= 0.7 (high)
+  - Heuristic sources (confidence >= 0.25) ALWAYS allowed (no global block)
+  - Clear intent lowers thresholds for low/medium risk actions
+  - Replaces "useless `wait`" with "useful guesses"
+
 - `layout.py`
   - Assigns each UI element to `TOP_BAR`, `CENTER`, `LEFT_PANEL`, `RIGHT_PANEL`, or `FOOTER`
 
@@ -107,6 +122,8 @@ The current implementation enforces:
 
 - `ranking.py`
   - Scores candidates by confidence, size, type relevance, position heuristics, and cluster context
+  - **NEW**: CENTER region bias: +0.15 for center region, +0.15 for wide (w/h > 2.5) elements (total +0.30 boost)
+  - Prioritizes horizontally-stretched center elements (typical search/input pattern)
 
 - `resolver.py`
   - Resolves a safe target through:
