@@ -1,0 +1,5 @@
+FROM gemma4:e2b
+
+# Keep your existing parameters
+PARAMETER num_ctx 4096
+PARAMETER temperature 0.1

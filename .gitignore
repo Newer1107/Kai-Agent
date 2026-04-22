@@ -1,0 +1,56 @@
+# Python environment
+venv311/
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Large model weights (if not checking in)
+# Uncomment below to ignore, or check in trained models
+*.pt
+yolov8n.pt
+yolov26n.pt
+
+# YOLO runs cache (intermediate training outputs)
+runs/detect/train*/args.yaml
+runs/detect/train*/weights/last.pt
+runs/detect/train*/weights/last.yaml
+runs/detect/train*/plots/
+
+# Debug outputs
+debug/
+*.jpg
+*.png
+
+# Temporary files
+*.tmp
+*.bak
+*.log

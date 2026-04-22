@@ -1,0 +1,23 @@
+train: C:/Users/Raunak/.cache/kagglehub/datasets/daudaudinang/ui-elements-detection-dataset/versions/2/train/images
+val: C:/Users/Raunak/.cache/kagglehub/datasets/daudaudinang/ui-elements-detection-dataset/versions/2/val/images
+test: C:/Users/Raunak/.cache/kagglehub/datasets/daudaudinang/ui-elements-detection-dataset/versions/2/test/images
+
+names:
+  0: link
+  1: button
+  2: input
+  3: select
+  4: textarea
+  5: label
+  6: checkbox
+  7: radio
+  8: dropdown
+  9: slider
+  10: toggle
+  11: menu_item
+  12: clickable
+  13: icon
+  14: image
+  15: text
+
+nc: 16
