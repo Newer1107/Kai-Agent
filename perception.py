@@ -10,8 +10,7 @@ import pyautogui
 from PIL import Image, ImageGrab
 
 from detector import DetectorError, detect_ui_elements
-from layout import attach_regions
-from semantics import attach_semantics, extract_text_regions
+from heuristics import build_hybrid_candidates
 
 
 @dataclass(frozen=True)
@@ -67,38 +66,64 @@ def capture_screen_as_base64(max_width: int = 1280) -> str:
 def capture_screen_for_inference(
     max_width: int = 1280,
     enable_ocr: bool | None = None,
+    enriched: bool = True,
 ) -> ScreenInferencePayload:
-    """Capture screen and return image, encoded image, and enriched UI detections."""
+    """Capture screen and return image, encoded image, and fast UI detections."""
     screenshot = capture_primary_screenshot()
     resized = resize_for_inference(screenshot, max_width=max_width)
 
-    if enable_ocr is None:
-        enable_ocr = os.getenv("KAI_ENABLE_OCR", "0").strip().lower() in {"1", "true", "yes", "on"}
-
     try:
-        elements = detect_ui_elements(screenshot)
+        elements = detect_ui_elements(screenshot, max_width=max_width)
     except DetectorError:
         elements = []
 
-    regions_attached = attach_regions(elements, (screenshot.width, screenshot.height))
-    text_regions = extract_text_regions(screenshot, enabled=enable_ocr)
-    enriched_elements = attach_semantics(regions_attached, text_regions)
+    text_regions: List[dict[str, Any]] = []
+    final_elements = elements
+    ocr_enabled = False
+
+    if enriched:
+        if enable_ocr is None:
+            enable_ocr = os.getenv("KAI_ENABLE_OCR", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+        try:
+            from layout import attach_regions
+            from semantics import attach_semantics, extract_text_regions
+
+            regions_attached = attach_regions(elements, (screenshot.width, screenshot.height))
+            text_regions = extract_text_regions(screenshot, enabled=enable_ocr)
+            final_elements = attach_semantics(regions_attached, text_regions)
+            ocr_enabled = bool(enable_ocr)
+        except Exception:
+            # Fall back to raw detections if enrichment fails.
+            text_regions = []
+            final_elements = elements
+            ocr_enabled = False
+
+    try:
+        from layout import attach_regions
+
+        final_elements = build_hybrid_candidates(
+            attach_regions(final_elements, (screenshot.width, screenshot.height)),
+            (screenshot.width, screenshot.height),
+        )
+    except Exception:
+        final_elements = elements
 
     return ScreenInferencePayload(
         image=screenshot.copy(),
         image_base64=encode_image_to_base64(resized),
-        ui_elements=enriched_elements,
+        ui_elements=final_elements,
         text_regions=text_regions,
-        ocr_enabled=bool(enable_ocr),
+        ocr_enabled=ocr_enabled,
         original_size=(screenshot.width, screenshot.height),
         resized_size=(resized.width, resized.height),
         region_offset=(0, 0),
     )
 
 
-def capture_structured_perception(max_width: int = 1280) -> dict[str, Any]:
+def capture_structured_perception(max_width: int = 1280, enriched: bool = False) -> dict[str, Any]:
     """Capture screen and return multimodal payload for reasoning."""
-    payload = capture_screen_for_inference(max_width=max_width)
+    payload = capture_screen_for_inference(max_width=max_width, enriched=enriched)
     return {
         "image_base64": payload.image_base64,
         "ui_elements": payload.ui_elements,

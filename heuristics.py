@@ -36,6 +36,125 @@ def _is_center_region(element: dict[str, Any], screen_w: int, screen_h: int) -> 
     return x_margin <= cx <= (screen_w - x_margin) and y_margin <= cy <= (screen_h - y_margin)
 
 
+def _aspect_ratio(element: dict[str, Any]) -> float:
+    bbox = element.get("bbox", [0, 0, 0, 0])
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    return width / height
+
+
+def _area_ratio(element: dict[str, Any], screen_width: int, screen_height: int) -> float:
+    bbox = element.get("bbox", [0, 0, 0, 0])
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    area = max(1, (x2 - x1) * (y2 - y1))
+    return float(area) / max(1.0, float(screen_width * screen_height))
+
+
+def compute_affordances(element: dict[str, Any], screen_size: tuple[int, int]) -> dict[str, Any]:
+    screen_width, screen_height = int(screen_size[0]), int(screen_size[1])
+    aspect_ratio = _aspect_ratio(element)
+    area_ratio = _area_ratio(element, screen_width, screen_height)
+    cx, cy = _center(element)
+    center_dx = abs(cx - (screen_width / 2.0)) / max(1.0, screen_width / 2.0)
+    center_dy = abs(cy - (screen_height / 2.0)) / max(1.0, screen_height / 2.0)
+    center_bias = max(0.0, 1.0 - ((center_dx + center_dy) / 2.0))
+
+    text = " ".join(
+        [
+            str(element.get("text", "")),
+            str(element.get("semantic_label", "")),
+            str(element.get("type", "")),
+        ]
+    ).lower()
+    text_hint = any(token in text for token in ["search", "enter", "type", "input", "find", "login", "submit"])
+
+    can_type = aspect_ratio > 3.0 and screen_width > 0 and screen_height > 0 and _area_ratio(element, screen_width, screen_height) > 0.002
+    if aspect_ratio > 3.0 and (aspect_ratio > 3.0 and int(element.get("bbox", [0, 0, 0, 0])[2]) - int(element.get("bbox", [0, 0, 0, 0])[0]) > 150):
+        can_type = True
+    if text_hint:
+        can_type = True
+
+    size_bias = max(0.0, min(1.0, area_ratio / 0.08))
+    text_bias = 1.0 if text_hint else 0.0
+    importance_score = max(0.0, min(1.0, (0.45 * center_bias) + (0.35 * size_bias) + (0.20 * text_bias)))
+    if can_type:
+        importance_score = min(1.0, importance_score + 0.12)
+
+    return {
+        "can_type": can_type,
+        "can_click": True,
+        "importance_score": round(importance_score, 4),
+        "center_bias": round(center_bias, 4),
+        "size_bias": round(size_bias, 4),
+        "text_bias": round(text_bias, 4),
+    }
+
+
+def _annotate_affordances(element: dict[str, Any], screen_size: tuple[int, int]) -> dict[str, Any]:
+    item = dict(element)
+    item.update(compute_affordances(item, screen_size))
+    return item
+
+
+def _dedupe_elements(elements: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    deduped: list[dict[str, Any]] = []
+    for element in elements:
+        bbox = tuple(int(v) for v in element.get("bbox", [0, 0, 0, 0]))
+        key = (bbox, str(element.get("type", "")), str(element.get("source", "")), str(element.get("text", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(element)
+    return deduped
+
+
+def detect_button_by_shape(
+    elements: list[dict[str, Any]],
+    screen_width: int,
+    screen_height: int,
+) -> Optional[dict[str, Any]]:
+    candidates = []
+    for element in elements:
+        bbox = element.get("bbox", [0, 0, 0, 0])
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        aspect = width / height
+        area = (width * height) / max(1.0, float(screen_width * screen_height))
+        if 1.1 <= aspect <= 7.5 and 0.0007 <= area <= 0.14 and height >= 18:
+            candidates.append((element, float(element.get("confidence", 0.0))))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    best, conf = candidates[0]
+    heuristic_element = dict(best)
+    heuristic_element["source"] = "heuristic_button_shape"
+    heuristic_element["confidence"] = max(conf, 0.35)
+    heuristic_element.update(compute_affordances(heuristic_element, (screen_width, screen_height)))
+    return heuristic_element
+
+
+def build_hybrid_candidates(elements: list[dict[str, Any]], screen_size: tuple[int, int]) -> list[dict[str, Any]]:
+    screen_width, screen_height = int(screen_size[0]), int(screen_size[1])
+    enriched = [_annotate_affordances(element, screen_size) for element in elements]
+
+    if not any(bool(item.get("can_type", False)) for item in enriched):
+        synthetic_input = infer_input_field(screen_width, screen_height)
+        synthetic_input["source"] = "heuristic_center"
+        synthetic_input.update(compute_affordances(synthetic_input, screen_size))
+        enriched.append(synthetic_input)
+
+    button_candidate = detect_button_by_shape(enriched, screen_width, screen_height)
+    if button_candidate is not None:
+        enriched.append(button_candidate)
+
+    return _dedupe_elements(enriched)
+
+
 def infer_input_field(screen_width: int, screen_height: int) -> dict[str, Any]:
     """Generate heuristic input field at screen center (typical position for search/input)."""
     cx = screen_width // 2

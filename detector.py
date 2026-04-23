@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -34,10 +35,15 @@ class DetectorError(RuntimeError):
 
 _MODEL: YOLO | None = None
 _MODEL_LOCK = threading.Lock()
-_TRAINED_MODEL_PATH = Path(r"C:\Users\Raunak\Documents\Kai\runs\detect\train-14\weights\best.pt")
+_TRAINED_MODEL_PATH = Path(r"C:\Users\Raunak\Documents\Kai\runs\detect\train-4\weights\best.pt")
 _FALLBACK_MODEL_PATH = Path("yolov8n.pt")
-_MIN_CONFIDENCE = 0.5
+_MIN_CONFIDENCE = 0.4
 _LAST_INFERENCE_MS: float = 0.0
+_CACHE_LOCK = threading.Lock()
+_LAST_CACHE_SIGNATURE: str | None = None
+_LAST_CACHE_RESULTS: List[dict[str, Any]] = []
+_LAST_CACHE_TIME: float = 0.0
+_CACHE_TTL_SECONDS = 1.5
 
 
 def _ensure_runtime_deps() -> None:
@@ -72,10 +78,28 @@ def load_model() -> YOLO:
     return _MODEL
 
 
-def _resolve_inference_device() -> str:
+def _resolve_inference_device() -> int | str:
     if torch is not None and torch.cuda.is_available():
-        return "cuda:0"
+        return 0
     return "cpu"
+
+
+def _resize_for_detection(image: Image.Image, max_width: int) -> tuple[Image.Image, tuple[float, float]]:
+    if image.width <= max_width:
+        return image.copy(), (1.0, 1.0)
+
+    ratio = max_width / float(image.width)
+    new_height = max(1, int(image.height * ratio))
+    resampling = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+    resized = image.resize((max_width, new_height), resampling)
+    scale_x = image.width / float(resized.width)
+    scale_y = image.height / float(resized.height)
+    return resized, (scale_x, scale_y)
+
+
+def _image_signature(image: Image.Image) -> str:
+    sample = image.convert("RGB").resize((96, 54))
+    return hashlib.sha1(sample.tobytes()).hexdigest()
 
 
 def _to_numpy_rgb(image: Any) -> np.ndarray:
@@ -106,12 +130,19 @@ def filter_by_type(elements: List[dict[str, Any]], type_name: str) -> List[dict[
     return [e for e in elements if str(e.get("type", "")).lower() == wanted]
 
 
-def detect_ui_elements(image: Image.Image) -> List[dict[str, Any]]:
+def detect_ui_elements(image: Image.Image, max_width: int = 1280) -> List[dict[str, Any]]:
     """Detect UI elements and return clean structured detections."""
-    global _LAST_INFERENCE_MS
+    global _LAST_INFERENCE_MS, _LAST_CACHE_SIGNATURE, _LAST_CACHE_RESULTS, _LAST_CACHE_TIME
     _ensure_runtime_deps()
     model = load_model()
-    rgb = _to_numpy_rgb(image)
+    detection_image, (scale_x, scale_y) = _resize_for_detection(image, max_width=max_width)
+    signature = _image_signature(detection_image)
+
+    with _CACHE_LOCK:
+        if signature == _LAST_CACHE_SIGNATURE and (time.perf_counter() - _LAST_CACHE_TIME) <= _CACHE_TTL_SECONDS:
+            return [dict(item) for item in _LAST_CACHE_RESULTS]
+
+    rgb = _to_numpy_rgb(detection_image)
     device = _resolve_inference_device()
 
     start = time.perf_counter()
@@ -147,6 +178,11 @@ def detect_ui_elements(image: Image.Image) -> List[dict[str, Any]]:
                 label = str(names[cls_id])
 
             x1, y1, x2, y2 = [int(round(v)) for v in box.xyxy[0].tolist()]
+            if scale_x != 1.0 or scale_y != 1.0:
+                x1 = int(round(x1 * scale_x))
+                y1 = int(round(y1 * scale_y))
+                x2 = int(round(x2 * scale_x))
+                y2 = int(round(y2 * scale_y))
             bbox = [x1, y1, x2, y2]
             center = get_center(bbox)
 
@@ -160,6 +196,10 @@ def detect_ui_elements(image: Image.Image) -> List[dict[str, Any]]:
             )
 
     elements.sort(key=lambda item: float(item["confidence"]), reverse=True)
+    with _CACHE_LOCK:
+        _LAST_CACHE_SIGNATURE = signature
+        _LAST_CACHE_RESULTS = [dict(item) for item in elements]
+        _LAST_CACHE_TIME = time.perf_counter()
     return elements
 
 
@@ -177,10 +217,18 @@ def draw_detections(
         bbox = element.get("bbox", [0, 0, 0, 0])
         label = str(element.get("type", "unknown"))
         confidence = float(element.get("confidence", 0.0))
+        text = str(element.get("text", "") or "")
+        can_type = bool(element.get("can_type", False))
+        can_click = bool(element.get("can_click", False))
+        importance = float(element.get("importance_score", 0.0))
 
         x1, y1, x2, y2 = [int(v) for v in bbox]
         draw.rectangle([(x1, y1), (x2, y2)], outline=(70, 180, 255), width=2)
-        draw.text((x1 + 2, max(2, y1 - 14)), f"{label} {confidence:.2f}", fill=(70, 180, 255))
+        caption = f"{label} {confidence:.2f}"
+        if text:
+            caption += f" | {text[:32]}"
+        caption += f" | T:{int(can_type)} C:{int(can_click)} I:{importance:.2f}"
+        draw.text((x1 + 2, max(2, y1 - 14)), caption, fill=(70, 180, 255))
 
     if output_path:
         out = Path(output_path)

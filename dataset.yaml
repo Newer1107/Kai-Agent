@@ -1,6 +1,7 @@
-train: C:/Users/Raunak/.cache/kagglehub/datasets/daudaudinang/ui-elements-detection-dataset/versions/2/train/images
-val: C:/Users/Raunak/.cache/kagglehub/datasets/daudaudinang/ui-elements-detection-dataset/versions/2/val/images
-test: C:/Users/Raunak/.cache/kagglehub/datasets/daudaudinang/ui-elements-detection-dataset/versions/2/test/images
+path: C:\Users\Raunak\.cache\huggingface\hub\datasets--YashJain--UI-Elements-Detection-Dataset\snapshots\0adda54cdc45cb8960b4e75580f78aad40fbcc3c\yolo_dataset
+
+train: images
+val: images
 
 names:
   0: link
@@ -19,5 +20,3 @@ names:
   13: icon
   14: image
   15: text
-
-nc: 16

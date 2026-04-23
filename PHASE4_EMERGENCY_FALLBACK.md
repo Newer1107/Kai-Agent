@@ -1,4 +1,8 @@
-# Phase 4: Emergency Fallback System - Implementation Summary
+# Phase 4: Emergency Fallback System - Implementation Summary (Legacy)
+
+> Note: This document is retained for historical context.
+> Current runtime architecture is the fast iterative loop in `agent_loop.py` (observe -> decide -> act -> observe).
+> The old instructor/multi-retry reasoning pipeline is no longer on the primary execution path.
 
 ## Problem Solved
 System was returning `wait` too often due to:

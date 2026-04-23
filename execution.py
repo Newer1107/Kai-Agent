@@ -5,7 +5,7 @@ from typing import Any, Optional, Tuple
 import pyautogui
 
 from schema import ActionEnum, UIAction
-from policy import get_action_risk, get_min_confidence_for_action, is_intent_clear
+from policy import get_action_risk, get_min_confidence_for_action
 
 try:
     import win32api
@@ -17,7 +17,7 @@ except Exception:
 
 
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.05
+pyautogui.PAUSE = 0.02
 
 
 def request_user_approval(action: UIAction) -> bool:
@@ -102,6 +102,15 @@ def resolve_action_coordinates(
 ) -> Optional[Tuple[int, int]]:
     """Resolve execution coordinates using risk-based confidence policy."""
     if not selected_element:
+        if action.target_coordinates is not None:
+            try:
+                x, y = int(action.target_coordinates[0]), int(action.target_coordinates[1])
+                if validate_coordinates(x, y):
+                    print("[EXEC POLICY] Using direct action target coordinates.")
+                    return x, y
+            except Exception:
+                pass
+
         print("Execution skipped: no selected UI element was provided.")
         return None
 
@@ -154,6 +163,18 @@ def execute_action(
         print("No action executed (wait).")
         return False
 
+    if action.action == ActionEnum.ENTER:
+        try:
+            pyautogui.press("enter")
+            print("Action executed successfully.")
+            return True
+        except pyautogui.FailSafeException:
+            print("Execution aborted by pyautogui fail-safe (cursor moved to top-left corner).")
+            return False
+        except Exception as exc:
+            print(f"Execution failed safely: {exc}")
+            return False
+
     resolved = resolve_action_coordinates(action, selected_element=selected_element, min_confidence=0.5)
     if resolved is None:
         print("Execution skipped: no valid coordinates resolved from selected UI element.")
@@ -180,7 +201,7 @@ def execute_action(
         return False
 
     try:
-        pyautogui.moveTo(x, y, duration=0.5)
+        pyautogui.moveTo(x, y, duration=0.08)
 
         if action.action == ActionEnum.CLICK:
             pyautogui.click(x=x, y=y)
@@ -190,10 +211,10 @@ def execute_action(
                 print("Execution skipped: action='type' but text_to_type is empty.")
                 return False
             pyautogui.click(x=x, y=y)
-            pyautogui.typewrite(action.text_to_type, interval=0.01)
+            pyautogui.typewrite(action.text_to_type, interval=0.005)
 
         elif action.action == ActionEnum.SCROLL:
-            pyautogui.moveTo(x=x, y=y, duration=0.1)
+            pyautogui.moveTo(x=x, y=y, duration=0.05)
             pyautogui.scroll(_scroll_amount_from_description(action.target_description))
 
         else:

@@ -10,6 +10,7 @@ class ActionEnum(str, Enum):
     CLICK = "click"
     TYPE = "type"
     SCROLL = "scroll"
+    ENTER = "enter"
     WAIT = "wait"
 
 

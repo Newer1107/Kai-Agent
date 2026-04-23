@@ -32,10 +32,14 @@ def draw_target_preview(
     text = str(element.get("text", ""))
     region = str(element.get("region", ""))
     score = float(element.get("resolution_score", 0.0))
+    can_type = bool(element.get("can_type", False))
+    can_click = bool(element.get("can_click", False))
+    importance = float(element.get("importance_score", 0.0))
 
     caption = (
         f"TARGET: {label} conf={confidence:.2f} score={score:.2f} "
-        f"region={region} semantic={semantic} text={text}"
+        f"region={region} semantic={semantic} text={text[:40]} "
+        f"T:{int(can_type)} C:{int(can_click)} I:{importance:.2f}"
     )
     draw.text((x1 + 2, max(2, y1 - 14)), caption, fill=(30, 220, 120))
 
