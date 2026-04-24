@@ -1,11 +1,14 @@
-from huggingface_hub import snapshot_download
+from ultralytics import YOLO
 
-local_path = snapshot_download(
-    repo_id="YashJain/UI-Elements-Detection-Dataset",
-    repo_type="dataset",
-    allow_patterns="yolo_dataset/*",
-    local_dir="../yolo_dataset",   # ← parent folder
-    local_dir_use_symlinks=False   # ← important on Windows
-)
+def main():
+    model = YOLO("yolov8n.pt")
 
-print("Downloaded YOLO dataset to:", local_path)
+    model.train(
+        data="dataset.yaml",
+        epochs=20,
+        imgsz=640,
+        batch=16
+    )
+
+if __name__ == "__main__":
+    main()
