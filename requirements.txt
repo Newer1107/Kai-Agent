@@ -8,3 +8,5 @@ ultralytics>=8.3.0
 opencv-python>=4.10.0.84
 numpy>=1.26.0
 pytesseract>=0.3.10
+pyperclip>=1.8.2
+send2trash>=1.8.3

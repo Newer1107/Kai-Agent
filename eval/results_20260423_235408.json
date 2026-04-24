@@ -1,0 +1,87 @@
+[
+  {
+    "task_id": "browser_google_search",
+    "goal": "open chrome and search kai agent",
+    "app_context": "browser",
+    "difficulty": "easy",
+    "passed": true,
+    "steps_used": 2,
+    "max_steps": 8,
+    "time_elapsed": 2.305,
+    "fallback_triggered": false,
+    "verification_result": {
+      "success": true,
+      "confidence": 0.7,
+      "method": "layer2"
+    },
+    "stopped_consecutive_failures": false
+  },
+  {
+    "task_id": "browser_search_hello_kitty",
+    "goal": "search hello kitty",
+    "app_context": "browser",
+    "difficulty": "easy",
+    "passed": false,
+    "steps_used": 1,
+    "max_steps": 6,
+    "time_elapsed": 0.61,
+    "fallback_triggered": false,
+    "verification_result": {
+      "success": false,
+      "confidence": 0.0,
+      "method": "layer1"
+    },
+    "stopped_consecutive_failures": false
+  },
+  {
+    "task_id": "explorer_open_documents",
+    "goal": "open file explorer and click documents",
+    "app_context": "file explorer",
+    "difficulty": "easy",
+    "passed": false,
+    "steps_used": 1,
+    "max_steps": 7,
+    "time_elapsed": 0.647,
+    "fallback_triggered": false,
+    "verification_result": {
+      "success": false,
+      "confidence": 0.0,
+      "method": "layer1"
+    },
+    "stopped_consecutive_failures": false
+  },
+  {
+    "task_id": "explorer_select_downloads",
+    "goal": "open file explorer then click downloads",
+    "app_context": "file explorer",
+    "difficulty": "easy",
+    "passed": false,
+    "steps_used": 1,
+    "max_steps": 8,
+    "time_elapsed": 0.619,
+    "fallback_triggered": false,
+    "verification_result": {
+      "success": false,
+      "confidence": 0.0,
+      "method": "layer1"
+    },
+    "stopped_consecutive_failures": false
+  },
+  {
+    "task_id": "notepad_type_line",
+    "goal": "open notepad and type hello world",
+    "app_context": "notepad",
+    "difficulty": "easy",
+    "passed": false,
+    "steps_used": 1,
+    "max_steps": 6,
+    "time_elapsed": 0.623,
+    "fallback_triggered": false,
+    "verification_result": {
+      "success": false,
+      "confidence": 0.0,
+      "method": "layer1"
+    },
+    "stopped_consecutive_failures": false
+  }
+]

@@ -213,7 +213,7 @@ def _llm_parse_goal_once(goal: str) -> GoalIntent | None:
         )
 
         response = client.chat.completions.create(
-            model=os.getenv("OLLAMA_MODEL", "gemma4:e2b"),
+            model=os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b"),
             temperature=0.0,
             max_tokens=120,
             messages=[

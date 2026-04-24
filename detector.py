@@ -35,10 +35,11 @@ class DetectorError(RuntimeError):
 
 _MODEL: YOLO | None = None
 _MODEL_LOCK = threading.Lock()
-_TRAINED_MODEL_PATH = Path(r"C:\Users\Raunak\Documents\Kai\runs\detect\train-4\weights\best.pt")
+_TRAINED_MODEL_PATH = Path(r"C:\Users\Raunak\Documents\Kai\runs\detect\train-14\weights\best.pt")
 _FALLBACK_MODEL_PATH = Path("yolov8n.pt")
 _MIN_CONFIDENCE = 0.4
 _LAST_INFERENCE_MS: float = 0.0
+_LAST_FALLBACK_USED: bool = False
 _CACHE_LOCK = threading.Lock()
 _LAST_CACHE_SIGNATURE: str | None = None
 _LAST_CACHE_RESULTS: List[dict[str, Any]] = []
@@ -61,7 +62,7 @@ def _resolve_model_path() -> str:
     return "yolov8n.pt"
 
 
-def load_model() -> YOLO:
+def load_model() -> Any:
     """Load and cache YOLO model globally to avoid repeated startup overhead."""
     global _MODEL
     _ensure_runtime_deps()
@@ -102,7 +103,7 @@ def _image_signature(image: Image.Image) -> str:
     return hashlib.sha1(sample.tobytes()).hexdigest()
 
 
-def _to_numpy_rgb(image: Any) -> np.ndarray:
+def _to_numpy_rgb(image: Any) -> Any:
     if isinstance(image, Image.Image):
         return np.asarray(image.convert("RGB"))
 
@@ -132,7 +133,8 @@ def filter_by_type(elements: List[dict[str, Any]], type_name: str) -> List[dict[
 
 def detect_ui_elements(image: Image.Image, max_width: int = 1280) -> List[dict[str, Any]]:
     """Detect UI elements and return clean structured detections."""
-    global _LAST_INFERENCE_MS, _LAST_CACHE_SIGNATURE, _LAST_CACHE_RESULTS, _LAST_CACHE_TIME
+    global _LAST_INFERENCE_MS, _LAST_FALLBACK_USED, _LAST_CACHE_SIGNATURE, _LAST_CACHE_RESULTS, _LAST_CACHE_TIME
+    _LAST_FALLBACK_USED = False
     _ensure_runtime_deps()
     model = load_model()
     detection_image, (scale_x, scale_y) = _resize_for_detection(image, max_width=max_width)
@@ -153,6 +155,7 @@ def detect_ui_elements(image: Image.Image, max_width: int = 1280) -> List[dict[s
             try:
                 results = model.predict(source=rgb, conf=_MIN_CONFIDENCE, verbose=False, device="cpu")
                 device = "cpu"
+                _LAST_FALLBACK_USED = True
             except Exception:
                 raise DetectorError(f"YOLO inference failed: {exc}") from exc
         else:
@@ -247,3 +250,7 @@ def draw_detections(
 def get_last_inference_ms() -> float:
     """Expose last measured inference latency in milliseconds for diagnostics."""
     return _LAST_INFERENCE_MS
+
+
+def get_last_fallback_used() -> bool:
+    return _LAST_FALLBACK_USED

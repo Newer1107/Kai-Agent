@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from threading import Lock
 from typing import Any, Callable, Optional
 
 from PIL import Image, ImageChops, ImageStat
+
+try:
+    import pytesseract
+except Exception:  # pragma: no cover
+    pytesseract = None
+
+from openai import OpenAI
 
 from execution import execute_action
 from perception import ScreenInferencePayload, capture_primary_screenshot, capture_screen_for_inference
 from reasoning import GoalIntent, ParsedIntent, parse_goal, parse_intent
 from schema import ActionEnum, UIAction, safe_wait_action
-from heuristics import compute_affordances, build_hybrid_candidates
+from heuristics import compute_affordances
 
 
 @dataclass(frozen=True)
@@ -57,6 +67,26 @@ class StepResult:
     decision: DecisionResult
     executed: bool
     step_ms: float
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    success: bool
+    confidence: float
+    method: str
+
+
+_VERIFY_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_VERIFY_CACHE_LOCK = Lock()
+
+_GOAL_KEYWORD_MAP: dict[str, list[str]] = {
+    "search": ["results", "found", "loaded"],
+    "open": ["visible", "launched", "active"],
+    "type": ["typed", "entered", "filled"],
+    "click": ["changed", "selected", "activated"],
+    "close": ["closed", "dismissed", "gone"],
+    "submit": ["submitted", "sent", "confirmed"],
+}
 
 
 def observe_state(max_width: int = 1280) -> LoopState:
@@ -206,11 +236,34 @@ def _shape_bias(element: dict[str, Any], mode: str, screen_size: tuple[int, int]
     return 0.35
 
 
+def _context_adjustment_bonus(
+    element: dict[str, Any],
+    mode: str,
+    screen_size: tuple[int, int],
+    app_name: str,
+) -> tuple[float, str]:
+    app = (app_name or "unknown").lower()
+    aspect = _aspect_ratio(element, screen_size)
+    x1, y1, x2, y2 = _get_bbox(element, screen_size)
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    center = _center_bias(element, screen_size)
+
+    if app in {"chrome", "firefox"} and mode == "input" and aspect > 3.0 and center > 0.45:
+        return 0.12, "boost_wide_center_search"
+
+    if app == "explorer" and mode == "click" and (height / max(1.0, float(width))) > 1.3:
+        return 0.10, "boost_tall_narrow_explorer"
+
+    return 0.0, "none"
+
+
 def score_element(
     element: dict[str, Any],
     goal: str,
     screen_size: tuple[int, int],
     target_hint: str | None = None,
+    app_name: str = "unknown",
 ) -> tuple[float, dict[str, float]]:
     mode = _goal_mode(goal)
     confidence = max(0.0, min(1.0, float(element.get("confidence", 0.0))))
@@ -225,6 +278,12 @@ def score_element(
         _text_similarity(goal, str(element.get("type", ""))),
     )
     affordance_score = float(affordances.get("importance_score", 0.0))
+    context_bonus, context_adjustment = _context_adjustment_bonus(
+        element=element,
+        mode=mode,
+        screen_size=screen_size,
+        app_name=app_name,
+    )
 
     score = (
         (confidence * 0.3)
@@ -240,6 +299,7 @@ def score_element(
         score += 0.06
     if bool(affordances.get("can_click", False)) and mode == "click":
         score += 0.03
+    score += context_bonus
 
     score = max(0.0, min(1.0, score))
 
@@ -251,6 +311,8 @@ def score_element(
         "goal_match": round(goal_match, 4),
         "text_similarity": round(text_similarity, 4),
         "affordance_score": round(affordance_score, 4),
+        "context_bonus": round(context_bonus, 4),
+        "context_adjustment": 1.0 if context_adjustment != "none" else 0.0,
         "can_type": 1.0 if bool(affordances.get("can_type", False)) else 0.0,
     }
 
@@ -261,10 +323,17 @@ def rank_elements(
     screen_size: tuple[int, int],
     top_k: int = 8,
     target_hint: str | None = None,
+    app_name: str = "unknown",
 ) -> list[RankedCandidate]:
     ranked: list[RankedCandidate] = []
     for element in elements:
-        score, breakdown = score_element(element, goal, screen_size, target_hint=target_hint)
+        score, breakdown = score_element(
+            element,
+            goal,
+            screen_size,
+            target_hint=target_hint,
+            app_name=app_name,
+        )
         ranked.append(
             RankedCandidate(
                 element=dict(element),
@@ -734,13 +803,135 @@ def screen_changed(prev_image: Image.Image, new_image: Image.Image, threshold: f
     return ratio > threshold
 
 
+def _verify_llm_enabled() -> bool:
+    return os.getenv("KAI_ENABLE_VERIFY_LLM", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extract_expected_keywords(goal: str) -> list[str]:
+    text = (goal or "").lower()
+    keywords: list[str] = []
+    for trigger, expected in _GOAL_KEYWORD_MAP.items():
+        if trigger in text:
+            keywords.extend(expected)
+    deduped: list[str] = []
+    for keyword in keywords:
+        if keyword not in deduped:
+            deduped.append(keyword)
+    return deduped
+
+
+def _extract_ocr_text_near_action(image: Image.Image, action: UIAction, radius: int = 220) -> str:
+    if pytesseract is None:
+        return ""
+    if action.target_coordinates is None:
+        return ""
+
+    x, y = int(action.target_coordinates[0]), int(action.target_coordinates[1])
+    width, height = image.size
+    x1 = max(0, x - radius)
+    y1 = max(0, y - radius)
+    x2 = min(width, x + radius)
+    y2 = min(height, y + radius)
+    if x2 <= x1 or y2 <= y1:
+        return ""
+
+    crop = image.convert("RGB").crop((x1, y1, x2, y2))
+    try:
+        text = pytesseract.image_to_string(crop)
+    except Exception:
+        return ""
+    return " ".join(str(text).split()).lower()
+
+
+def check_goal_completion(goal: str, prev_state: dict[str, Any], new_state: dict[str, Any]) -> bool:
+    expected_keywords = _extract_expected_keywords(goal)
+    if not expected_keywords:
+        structural_confidence = float(new_state.get("structural_confidence", 0.0))
+        return structural_confidence >= 0.4
+
+    ocr_enabled = os.getenv("KAI_ENABLE_OCR", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if ocr_enabled:
+        observed_text = str(new_state.get("ocr_text", "")).lower()
+        if any(keyword in observed_text for keyword in expected_keywords):
+            return True
+        return False
+
+    structural_confidence = float(new_state.get("structural_confidence", 0.0))
+    return structural_confidence >= 0.55
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        payload = json.loads(text[start : end + 1])
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _llm_verify_completion(goal: str, action: UIAction, changed: bool) -> dict[str, Any] | None:
+    if not _verify_llm_enabled():
+        return None
+
+    cache_key = ((goal or "").strip().lower(), action.action.value)
+    with _VERIFY_CACHE_LOCK:
+        cached = _VERIFY_CACHE.get(cache_key)
+    if cached is not None:
+        return dict(cached)
+
+    try:
+        client = OpenAI(
+            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+            api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
+        )
+        prompt = (
+            "Did this action complete the goal? "
+            f"Goal: {goal}. "
+            f"Action taken: {action.action.value}. "
+            f"Screen changed: {changed}. "
+            "Respond with JSON: {success: bool, reason: str}"
+        )
+
+        response = client.chat.completions.create(
+            model=os.getenv("OLLAMA_MODEL", "gemma4:e2b"),
+            temperature=0.0,
+            max_tokens=90,
+            timeout=2.0,
+            messages=[
+                {"role": "system", "content": "You are a strict GUI automation verifier. Return JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = (response.choices[0].message.content or "").strip()
+        parsed = _extract_json_object(content)
+        if not parsed:
+            return None
+
+        result = {
+            "success": bool(parsed.get("success", False)),
+            "reason": str(parsed.get("reason", "llm_verifier")),
+        }
+        with _VERIFY_CACHE_LOCK:
+            _VERIFY_CACHE[cache_key] = dict(result)
+        return result
+    except Exception as exc:
+        print(f"[VERIFY_LLM] fallback to layer1 due to {type(exc).__name__}")
+        return {"fallback_layer1": True, "reason": type(exc).__name__}
+
+
 def verify_success(
     prev_image: Image.Image,
     new_image: Image.Image,
     action: UIAction,
+    goal: str = "",
     prev_elements: list[dict[str, Any]] | None = None,
     new_elements: list[dict[str, Any]] | None = None,
-) -> bool:
+) -> VerificationResult:
     base_threshold = 0.01
     typing_threshold = 0.003
 
@@ -777,119 +968,196 @@ def verify_success(
         cx, cy = int(action.target_coordinates[0]), int(action.target_coordinates[1])
         local_focus_changed = _local_change_ratio(prev_image, new_image, (cx, cy), radius=28) > 0.01
 
-    success = changed or ui_changed or local_focus_changed
+    layer1_success = changed or ui_changed or local_focus_changed
+    layer1_confidence = max(
+        0.0,
+        min(
+            1.0,
+            (0.50 * (1.0 if changed else 0.0))
+            + (0.35 * (1.0 if ui_changed else 0.0))
+            + (0.15 * (1.0 if local_focus_changed else 0.0)),
+        ),
+    )
+
+    if not layer1_success:
+        print(
+            "[VERIFY] "
+            f"action={action.action.value} changed={changed} "
+            f"ui_changed={ui_changed} focus_changed={local_focus_changed} success=False method=layer1"
+        )
+        return VerificationResult(success=False, confidence=layer1_confidence, method="layer1")
+
+    structural_confidence = max(0.0, min(1.0, (0.6 if ui_changed else 0.0) + (0.4 if changed else 0.0)))
+    semantic_new_state = {
+        "ocr_text": _extract_ocr_text_near_action(new_image, action),
+        "structural_confidence": structural_confidence,
+    }
+    semantic_prev_state = {
+        "structural_confidence": 0.5 if changed else 0.0,
+    }
+    layer2_success = check_goal_completion(goal, semantic_prev_state, semantic_new_state)
+    if not layer2_success:
+        print(
+            "[VERIFY] "
+            f"action={action.action.value} changed={changed} "
+            f"ui_changed={ui_changed} focus_changed={local_focus_changed} success=False method=layer2"
+        )
+        return VerificationResult(success=False, confidence=max(0.3, layer1_confidence * 0.7), method="layer2")
+
+    llm_result = _llm_verify_completion(goal=goal, action=action, changed=changed)
+    if llm_result is not None and bool(llm_result.get("fallback_layer1", False)):
+        return VerificationResult(success=layer1_success, confidence=layer1_confidence, method="layer1")
+
+    if llm_result is not None:
+        llm_success = bool(llm_result.get("success", False))
+        method = "llm"
+        confidence = 0.9 if llm_success else 0.45
+        print(
+            "[VERIFY] "
+            f"action={action.action.value} changed={changed} "
+            f"ui_changed={ui_changed} focus_changed={local_focus_changed} success={llm_success} method={method}"
+        )
+        return VerificationResult(success=llm_success, confidence=confidence, method=method)
+
+    success = True
     print(
         "[VERIFY] "
         f"action={action.action.value} changed={changed} "
-        f"ui_changed={ui_changed} focus_changed={local_focus_changed} success={success}"
+        f"ui_changed={ui_changed} focus_changed={local_focus_changed} success={success} method=layer2"
     )
-    return success
+    return VerificationResult(success=True, confidence=max(0.7, layer1_confidence), method="layer2")
+
+
+def _wait_decision(
+    intent: GoalIntent | ParsedIntent,
+    reason: str,
+    start: float,
+) -> DecisionResult:
+    wait_action = safe_wait_action(
+        reason=reason,
+        intent_summary="No actionable intent found.",
+        next_step_summary="Wait for clearer goal input.",
+    )
+    return DecisionResult(
+        action=wait_action,
+        selected_element=None,
+        intent=intent,
+        used_fallback=False,
+        decision_ms=(time.perf_counter() - start) * 1000.0,
+        reason="intent_wait",
+        ranked_candidates=[],
+        candidate_plans=[],
+        planned_actions=[wait_action],
+    )
 
 
 def decide_action(
     state: LoopState,
     goal: str,
     last_action: Optional[UIAction] = None,
-    parsed_intent: ParsedIntent | None = None,
+    parsed_intent: ParsedIntent | GoalIntent | None = None,
 ) -> DecisionResult:
     start = time.perf_counter()
-    intent = parsed_intent or parse_goal(goal)
-    screen_size = state.payload.original_size
-    elements = list(state.payload.ui_elements or [])
+    try:
+        intent = parsed_intent or parse_goal(goal)
+        screen_size = state.payload.original_size
+        app_name = str(getattr(state.payload, "app_context", None).app_name if getattr(state.payload, "app_context", None) else "unknown")
+        elements = list(state.payload.ui_elements or [])
 
-    if intent.action == ActionEnum.WAIT:
-        wait_action = safe_wait_action(
-            reason="Intent parser returned wait.",
-            intent_summary="No actionable intent found.",
-            next_step_summary="Wait for clearer goal input.",
+        if intent.action == ActionEnum.WAIT:
+            return _wait_decision(intent=intent, reason="Intent parser returned wait.", start=start)
+
+        context_adjustment = "none"
+        goal_mode = _goal_mode(goal)
+        if app_name in {"notepad", "vscode"} and intent.action == ActionEnum.TYPE:
+            elements = [_make_center_input(screen_size)]
+            context_adjustment = "use_center_input_for_typing"
+        elif app_name in {"chrome", "firefox"} and goal_mode == "input":
+            context_adjustment = "boost_wide_center_search"
+        elif app_name == "explorer":
+            context_adjustment = "boost_tall_narrow_targets"
+        print(f"[CONTEXT_ADAPT] app={app_name} adjustment={context_adjustment}")
+
+        ranked = rank_elements(
+            elements=elements,
+            goal=goal,
+            screen_size=screen_size,
+            top_k=8,
+            target_hint=intent.target,
+            app_name=app_name,
         )
-        return DecisionResult(
-            action=wait_action,
-            selected_element=None,
+
+        used_fallback = False
+        reason = "ranked_candidates"
+
+        if not ranked and intent.action in {ActionEnum.CLICK, ActionEnum.TYPE}:
+            ranked = _fallback_ranked_candidates(intent, elements, screen_size)
+            used_fallback = bool(ranked)
+            reason = "heuristic_fallback" if used_fallback else "no_candidates"
+
+        candidate_plans = _build_candidate_plans(
             intent=intent,
-            used_fallback=False,
-            decision_ms=(time.perf_counter() - start) * 1000.0,
-            reason="intent_wait",
-            ranked_candidates=[],
-            candidate_plans=[],
-            planned_actions=[wait_action],
+            ranked_candidates=ranked,
+            goal=goal,
+            screen_size=screen_size,
+            last_action=last_action,
+            top_k=3,
         )
 
-    ranked = rank_elements(
-        elements=elements,
-        goal=goal,
-        screen_size=screen_size,
-        top_k=8,
-        target_hint=intent.target,
-    )
+        selected_plan = next((plan for plan in candidate_plans if plan.action.action != ActionEnum.WAIT), None)
+        if selected_plan is None:
+            wait_action = safe_wait_action(
+                reason="No executable candidate produced a non-wait action.",
+                intent_summary="Could not determine a robust next step.",
+                next_step_summary="Observe again and retry with updated state.",
+            )
+            action = wait_action
+            selected_element = None
+            planned_actions = [wait_action]
+            reason = "all_candidates_wait"
+        else:
+            action = selected_plan.action
+            selected_element = selected_plan.element
+            planned_actions = selected_plan.planned_actions
 
-    used_fallback = False
-    reason = "ranked_candidates"
+        decision_ms = (time.perf_counter() - start) * 1000.0
 
-    if not ranked and intent.action in {ActionEnum.CLICK, ActionEnum.TYPE}:
-        ranked = _fallback_ranked_candidates(intent, elements, screen_size)
-        used_fallback = bool(ranked)
-        reason = "heuristic_fallback" if used_fallback else "no_candidates"
-
-    candidate_plans = _build_candidate_plans(
-        intent=intent,
-        ranked_candidates=ranked,
-        goal=goal,
-        screen_size=screen_size,
-        last_action=last_action,
-        top_k=3,
-    )
-
-    selected_plan = next((plan for plan in candidate_plans if plan.action.action != ActionEnum.WAIT), None)
-    if selected_plan is None:
-        wait_action = safe_wait_action(
-            reason="No executable candidate produced a non-wait action.",
-            intent_summary="Could not determine a robust next step.",
-            next_step_summary="Observe again and retry with updated state.",
-        )
-        action = wait_action
-        selected_element = None
-        planned_actions = [wait_action]
-        reason = "all_candidates_wait"
-    else:
-        action = selected_plan.action
-        selected_element = selected_plan.element
-        planned_actions = selected_plan.planned_actions
-
-    decision_ms = (time.perf_counter() - start) * 1000.0
-
-    print(
-        "[DECISION] "
-        f"goal='{goal}' intent={intent.action.value} candidates={len(ranked)} "
-        f"used_fallback={used_fallback}"
-    )
-    for idx, ranked_candidate in enumerate(ranked[:3], start=1):
-        center = _get_center(ranked_candidate.element, fallback=(screen_size[0] // 2, screen_size[1] // 2))
         print(
             "[DECISION] "
-            f"#{idx} type={ranked_candidate.element.get('type')} center={center} "
-            f"score={ranked_candidate.score:.3f} breakdown={ranked_candidate.score_breakdown}"
+            f"goal='{goal}' intent={intent.action.value} candidates={len(ranked)} "
+            f"used_fallback={used_fallback}"
         )
+        for idx, ranked_candidate in enumerate(ranked[:3], start=1):
+            center = _get_center(ranked_candidate.element, fallback=(screen_size[0] // 2, screen_size[1] // 2))
+            print(
+                "[DECISION] "
+                f"#{idx} type={ranked_candidate.element.get('type')} center={center} "
+                f"score={ranked_candidate.score:.3f} breakdown={ranked_candidate.score_breakdown}"
+            )
 
-    print("[PLAN]")
-    for idx, planned_action in enumerate(planned_actions, start=1):
-        print(
-            f"[PLAN] Step {idx}: {planned_action.action.value} "
-            f"target={planned_action.target_label} coords={planned_action.target_coordinates} "
-            f"text={planned_action.text_to_type!r} conf={planned_action.confidence_score:.2f}"
+        print("[PLAN]")
+        for idx, planned_action in enumerate(planned_actions, start=1):
+            print(
+                f"[PLAN] Step {idx}: {planned_action.action.value} "
+                f"target={planned_action.target_label} coords={planned_action.target_coordinates} "
+                f"text={planned_action.text_to_type!r} conf={planned_action.confidence_score:.2f}"
+            )
+
+        return DecisionResult(
+            action=action,
+            selected_element=selected_element,
+            intent=intent,
+            used_fallback=used_fallback,
+            decision_ms=decision_ms,
+            reason=reason,
+            ranked_candidates=ranked,
+            candidate_plans=candidate_plans,
+            planned_actions=planned_actions,
         )
-
-    return DecisionResult(
-        action=action,
-        selected_element=selected_element,
-        intent=intent,
-        used_fallback=used_fallback,
-        decision_ms=decision_ms,
-        reason=reason,
-        ranked_candidates=ranked,
-        candidate_plans=candidate_plans,
-        planned_actions=planned_actions,
-    )
+    except Exception as exc:
+        print(f"[LOOP_ERROR] exception={type(exc).__name__}: {exc}")
+        safe_intent = parsed_intent or parse_goal(goal)
+        return _wait_decision(intent=safe_intent, reason="Loop decision failed; returning safe wait action.", start=start)
 
 
 def run_agent(
@@ -902,6 +1170,7 @@ def run_agent(
     results: list[StepResult] = []
     parsed_intent = parse_goal(goal)
     last_action: Optional[UIAction] = None
+    watchdog_ms = 5000.0
 
     for step in range(max(1, max_steps)):
         step_start = time.perf_counter()
@@ -956,7 +1225,14 @@ def run_agent(
                     break
 
                 new_image = capture_primary_screenshot()
-                if not verify_success(current_image, new_image, candidate_action, prev_elements=current_elements):
+                verification = verify_success(
+                    current_image,
+                    new_image,
+                    candidate_action,
+                    goal=goal,
+                    prev_elements=current_elements,
+                )
+                if not verification.success:
                     print(f"[RETRY] candidate #{idx} failed verification; trying next candidate")
                     candidate_success = False
                     break
@@ -989,7 +1265,14 @@ def run_agent(
                         executed_success = False
                         break
                     new_image = capture_primary_screenshot()
-                    if not verify_success(current_image, new_image, fallback_action, prev_elements=current_elements):
+                    verification = verify_success(
+                        current_image,
+                        new_image,
+                        fallback_action,
+                        goal=goal,
+                        prev_elements=current_elements,
+                    )
+                    if not verification.success:
                         executed_success = False
                         break
                     current_image = new_image
@@ -998,6 +1281,19 @@ def run_agent(
                     print("[RETRY] fallback failed verification")
 
         step_ms = (time.perf_counter() - step_start) * 1000.0
+        if step_ms > watchdog_ms:
+            print(f"[STEP_TIMEOUT] step={step} elapsed={step_ms:.1f}ms")
+            timeout_decision = _wait_decision(
+                intent=decision.intent,
+                reason="Step watchdog exceeded 5 seconds; forcing wait.",
+                start=step_start,
+            )
+            result = StepResult(step_index=step, decision=timeout_decision, executed=False, step_ms=step_ms)
+            results.append(result)
+            if after_step_callback is not None:
+                after_step_callback(result)
+            break
+
         result = StepResult(step_index=step, decision=decision, executed=executed_success, step_ms=step_ms)
         results.append(result)
 

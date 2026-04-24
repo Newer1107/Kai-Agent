@@ -34,13 +34,19 @@ This replaces the older one-shot pipeline that waited too often.
 - Planner and loop controller (`agent_loop.py`)
   - `score_element()` blends confidence, center bias, shape bias, text similarity, size, and affordance score
   - `decide_action()` builds multi-step plans such as click → type → enter
-  - `verify_success()` validates outcomes using pixel-diff, structure change, and focus-region change
+  - `verify_success()` runs layered verification (fast visual checks, semantic completion, optional LLM verifier)
   - `build_retry_fallback_plan()` still exists, but now reuses the same plan builder as the main path
 
 - Execution (`execution.py`)
   - Fast cursor movement and typing intervals remain in place
   - `enter` is a first-class action for form submission and confirmation steps
   - Confidence checks remain risk-based instead of hard-coded to one label source
+  - Fail-safe and out-of-bounds protection disable autopilot safely when needed
+
+- Universal command router (`universal_router.py`)
+  - Layer 1 deterministic fast paths for common app/web/file/system/clipboard/typing actions
+  - Layer 2 optional Ollama code-gen path with safety validation and bounded execution
+  - Layer 3 vision fallback delegates to the main agent loop with dynamic step budgeting
 
 ## Key Guarantees
 
@@ -50,7 +56,7 @@ This replaces the older one-shot pipeline that waited too often.
 4. Click goals can use best-available element fallback
 5. Manual mode requires explicit user approval before each execution
 6. Autopilot mode can execute multi-step loops without per-step approval
-7. Autopilot is bounded by max-step limit (`max_steps=5` by default)
+7. Autopilot is bounded by a dynamic step budget (estimated per goal)
 8. Autopilot stops on repeated failures, no screen-change, or very low confidence
 9. Emergency kill switch is always available (`Ctrl+Alt+S`)
 10. The system re-observes after execution to propose corrective follow-up actions
@@ -82,14 +88,9 @@ You can inspect per-step timing in logs:
 - `execution.py`
   - Action execution and coordinate resolution
 - `main.py`
-  - Chat UI, hotkeys, approval flow, and iterative follow-up proposal
-
-Legacy modules still present but not on the fast path:
-
-- `layout.py`
-- `semantics.py`
-- `ranking.py`
-- `resolver.py`
+  - Chat UI, hotkeys, approval flow, router dispatch, and iterative follow-up proposal
+- `universal_router.py`
+  - Three-layer universal execution router for non-slash natural language commands
 
 ## Requirements
 
@@ -126,9 +127,18 @@ py .\main.py
 - `/autopilot on`: Alias for enabling autopilot
 - `/autopilot off`: Alias for stopping autopilot
 - `/stop`: Stop autopilot immediately
-- `/status`: Show autopilot state and step counter
+- `/status`: Show autopilot state, dynamic budget, and remaining steps
 - `/goal <text>`: Set goal
 - `/reset`: Clear goal and action state
+- `/telemetry`: Show rolling per-label detection confidence summary
+- `/memory`: Show session-memory summary and app-context success distribution
+- `/benchmark`: Run quick 5-task benchmark suite in the background
+
+Non-slash chat input is routed through `UniversalRouter` in this order:
+
+1. Deterministic fast path
+2. Optional code generation path (if Ollama is reachable)
+3. Vision-agent fallback
 
 After a successful approval, Kai automatically observes the new screen and proposes the next plan.
 
@@ -181,11 +191,20 @@ Debug telemetry:
 
 ## Environment Variables
 
-- `OLLAMA_MODEL` (default: `gemma4:e2b`)
+- `OLLAMA_MODEL` (default: `qwen2.5-coder:1.5b`)
 - `OLLAMA_BASE_URL` (default: `http://localhost:11434/v1`)
 - `OLLAMA_API_KEY` (default: `ollama`)
 - `KAI_ENABLE_INTENT_LLM` (default: `0`)
-- `KAI_ENABLE_OCR` (only relevant if enriched perception is enabled)
+- `KAI_ENABLE_OCR` (default: `0`; enables OCR enrichment and semantic checks)
+- `KAI_ENABLE_VERIFY_LLM` (default: `0`; enables Layer 3 LLM verification with 2s timeout)
+- `KAI_TELEMETRY_LOG` (default: `0`; when enabled, writes `logs/telemetry_YYYY-MM-DD.jsonl`)
+- `KAI_PERSIST_MEMORY` (default: `0`; when enabled, persists successful tasks to `memory/session_YYYY-MM-DD.json`)
+
+## Logging
+
+- `logs/` is created on demand when writing runtime artifacts.
+- Autopilot runtime exceptions are appended to `logs/errors_YYYY-MM-DD.log`.
+- Telemetry JSONL files are created only when `KAI_TELEMETRY_LOG=1`.
 
 ## Notes
 

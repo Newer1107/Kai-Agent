@@ -4,6 +4,7 @@ from typing import Any, Optional, Tuple
 
 import pyautogui
 
+from agent_state import disable_autopilot
 from schema import ActionEnum, UIAction
 from policy import get_action_risk, get_min_confidence_for_action
 
@@ -18,6 +19,73 @@ except Exception:
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.02
+
+
+def _handle_failsafe(context: str) -> None:
+    print(f"[FAILSAFE] triggered during {context}; disabling autopilot")
+    disable_autopilot()
+
+
+def _screen_bounds() -> tuple[int, int]:
+    width, height = pyautogui.size()
+    return int(width), int(height)
+
+
+def _is_in_bounds(x: int, y: int, width: int, height: int) -> bool:
+    return 0 <= x <= width and 0 <= y <= height
+
+
+def _safe_move_to(x: int, y: int, duration: float) -> bool:
+    width, height = _screen_bounds()
+    if not _is_in_bounds(x, y, width, height):
+        print(f"[BOUNDS_ERROR] coords out of range: {(x, y)} for screen {(width, height)}")
+        return False
+    try:
+        pyautogui.moveTo(x, y, duration=duration)
+        return True
+    except pyautogui.FailSafeException:
+        _handle_failsafe("moveTo")
+        return False
+
+
+def _safe_click(x: int, y: int) -> bool:
+    width, height = _screen_bounds()
+    if not _is_in_bounds(x, y, width, height):
+        print(f"[BOUNDS_ERROR] coords out of range: {(x, y)} for screen {(width, height)}")
+        return False
+    try:
+        pyautogui.click(x=x, y=y)
+        return True
+    except pyautogui.FailSafeException:
+        _handle_failsafe("click")
+        return False
+
+
+def _safe_typewrite(text: str, interval: float) -> bool:
+    try:
+        pyautogui.typewrite(text, interval=interval)
+        return True
+    except pyautogui.FailSafeException:
+        _handle_failsafe("typewrite")
+        return False
+
+
+def _safe_scroll(amount: int) -> bool:
+    try:
+        pyautogui.scroll(amount)
+        return True
+    except pyautogui.FailSafeException:
+        _handle_failsafe("scroll")
+        return False
+
+
+def _safe_press(key: str) -> bool:
+    try:
+        pyautogui.press(key)
+        return True
+    except pyautogui.FailSafeException:
+        _handle_failsafe(f"press({key})")
+        return False
 
 
 def request_user_approval(action: UIAction) -> bool:
@@ -43,8 +111,8 @@ def request_user_approval(action: UIAction) -> bool:
 
 def validate_coordinates(x: int, y: int) -> bool:
     """Return True only when the coordinate is inside current screen bounds."""
-    width, height = pyautogui.size()
-    return 0 <= x < width and 0 <= y < height
+    width, height = _screen_bounds()
+    return _is_in_bounds(x, y, width, height)
 
 
 def scale_coordinates(
@@ -76,14 +144,13 @@ def to_screen_coordinates(
 def highlight_target(x: int, y: int) -> None:
     """Briefly move the cursor to visualize the target, then restore position."""
     if not validate_coordinates(x, y):
+        print(f"[BOUNDS_ERROR] coords out of range: {(x, y)}")
         return
 
     current = pyautogui.position()
-    try:
-        pyautogui.moveTo(x, y, duration=0.12)
-        pyautogui.moveTo(current.x, current.y, duration=0.12)
-    except Exception:
-        pass
+    if not _safe_move_to(x, y, duration=0.12):
+        return
+    _safe_move_to(int(current.x), int(current.y), duration=0.12)
 
 
 def _scroll_amount_from_description(target_description: str | None) -> int:
@@ -165,11 +232,12 @@ def execute_action(
 
     if action.action == ActionEnum.ENTER:
         try:
-            pyautogui.press("enter")
+            if not _safe_press("enter"):
+                return False
             print("Action executed successfully.")
             return True
         except pyautogui.FailSafeException:
-            print("Execution aborted by pyautogui fail-safe (cursor moved to top-left corner).")
+            _handle_failsafe("enter")
             return False
         except Exception as exc:
             print(f"Execution failed safely: {exc}")
@@ -201,21 +269,27 @@ def execute_action(
         return False
 
     try:
-        pyautogui.moveTo(x, y, duration=0.08)
+        if not _safe_move_to(x, y, duration=0.08):
+            return False
 
         if action.action == ActionEnum.CLICK:
-            pyautogui.click(x=x, y=y)
+            if not _safe_click(x, y):
+                return False
 
         elif action.action == ActionEnum.TYPE:
             if not action.text_to_type:
                 print("Execution skipped: action='type' but text_to_type is empty.")
                 return False
-            pyautogui.click(x=x, y=y)
-            pyautogui.typewrite(action.text_to_type, interval=0.005)
+            if not _safe_click(x, y):
+                return False
+            if not _safe_typewrite(action.text_to_type, interval=0.005):
+                return False
 
         elif action.action == ActionEnum.SCROLL:
-            pyautogui.moveTo(x=x, y=y, duration=0.05)
-            pyautogui.scroll(_scroll_amount_from_description(action.target_description))
+            if not _safe_move_to(x=x, y=y, duration=0.05):
+                return False
+            if not _safe_scroll(_scroll_amount_from_description(action.target_description)):
+                return False
 
         else:
             print("Execution skipped: unknown action type.")
@@ -225,7 +299,7 @@ def execute_action(
         return True
 
     except pyautogui.FailSafeException:
-        print("Execution aborted by pyautogui fail-safe (cursor moved to top-left corner).")
+        _handle_failsafe("execute_action")
         return False
     except Exception as exc:
         print(f"Execution failed safely: {exc}")

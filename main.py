@@ -17,9 +17,10 @@ from agent_state import (
     disable_autopilot,
     enable_autopilot,
     get_current_step,
+    get_dynamic_max_steps,
     get_goal,
     get_last_action,
-    get_max_steps,
+    get_remaining_budget,
     is_autopilot_enabled,
     set_current_step,
     set_goal,
@@ -34,11 +35,14 @@ from agent_loop import (
     verify_success,
 )
 from execution import execute_action, validate_coordinates
-from perception import capture_primary_screenshot
+from perception import capture_primary_screenshot, get_telemetry_summary
 from reasoning import clear_intent_cache
 from schema import ActionEnum, UIAction, safe_wait_action
 from detector import DetectorError, draw_detections
 from debug_overlay import draw_target_preview
+from memory.session_store import get_session_memory
+from eval.benchmark import run_quick_benchmark_suite
+from universal_router import UniversalRouter
 
 
 def enable_dpi_awareness() -> None:
@@ -230,6 +234,8 @@ class AssistantChatWindow:
         self._exit_requested = threading.Event()
         self._stop_auto_requested = threading.Event()
         self._pending_action: UIAction | None = None
+        self._session_memory = get_session_memory()
+        self._router = UniversalRouter(status_callback=self._router_status)
 
         self.root = tk.Tk()
         self.root.withdraw()
@@ -293,7 +299,7 @@ class AssistantChatWindow:
         self._append_chat("assistant", "Chat ready. Enter a goal or press Next Step.")
         self._append_chat(
             "assistant",
-            "Commands: /step, /approve, /reject, /auto, /autopilot on, /autopilot off, /stop, /status, /reset, /goal <text>, /help",
+            "Commands: /step, /approve, /reject, /auto, /autopilot on, /autopilot off, /stop, /status, /goal <text>, /reset, /telemetry, /memory, /benchmark, /help",
         )
 
     def run(self) -> None:
@@ -386,7 +392,7 @@ class AssistantChatWindow:
         if lower == "/help":
             self._append_chat(
                 "assistant",
-                "Commands: /step, /approve, /reject, /auto, /autopilot on, /autopilot off, /stop, /status, /reset, /goal <text>",
+                "Commands: /step, /approve, /reject, /auto, /autopilot on, /autopilot off, /stop, /status, /goal <text>, /reset, /telemetry, /memory, /benchmark",
             )
             return
 
@@ -412,6 +418,20 @@ class AssistantChatWindow:
             self._append_chat("assistant", self._autopilot_status_line())
             return
 
+        if lower == "/telemetry":
+            self._append_chat("assistant", self._format_telemetry_table())
+            return
+
+        if lower == "/memory":
+            self._append_chat("assistant", self._session_memory.get_summary())
+            return
+
+        if lower == "/benchmark":
+            self._append_chat("assistant", "[BENCHMARK] Running quick benchmark suite (5 easy tasks)...")
+            worker = threading.Thread(target=self._run_benchmark_worker, daemon=True)
+            worker.start()
+            return
+
         if lower == "/reset":
             self.on_reset()
             return
@@ -426,9 +446,8 @@ class AssistantChatWindow:
                 self._append_chat("assistant", "Goal was empty. Nothing changed.")
             return
 
-        set_goal(text)
-        self._refresh_goal_label()
-        self._append_chat("assistant", "Goal updated. Run /step when you want one safe next step.")
+        worker = threading.Thread(target=self._run_router_worker, args=(text,), daemon=True)
+        worker.start()
 
     def on_next_step(self) -> None:
         if is_autopilot_enabled():
@@ -478,6 +497,16 @@ class AssistantChatWindow:
         if not goal:
             self._append_chat("assistant", "[AUTO] Cannot start autopilot: set a goal first.")
             return
+
+        similar_tasks = self._session_memory.get_similar_tasks(goal, top_k=3)
+        if similar_tasks:
+            best = similar_tasks[0]
+            step_hint = len(best.actions)
+            status_text = "succeeded" if best.success else "failed"
+            self._append_chat(
+                "assistant",
+                f"[MEMORY] Similar past task: \"{best.goal}\" -> {status_text} in {step_hint} steps",
+            )
 
         if is_autopilot_enabled():
             self._append_chat("assistant", "[AUTO] Autopilot already running.")
@@ -564,15 +593,104 @@ class AssistantChatWindow:
     @staticmethod
     def _autopilot_status_line() -> str:
         mode = "ON" if is_autopilot_enabled() else "OFF"
+        goal = get_goal() or ""
+        current = get_current_step()
+        budget = get_dynamic_max_steps()
+        remaining = get_remaining_budget()
         return (
-            f"[AUTO] Status: {mode} | "
-            f"Step {get_current_step()}/{get_max_steps()}"
+            f"[STATUS] Autopilot: {mode} | Step: {current}/{budget} | "
+            f"Budget: dynamic (remaining {remaining}) | Goal: \"{goal}\""
         )
+
+    @staticmethod
+    def _format_telemetry_table() -> str:
+        summary = get_telemetry_summary()
+        labels = summary.get("labels", [])
+        if not labels:
+            return "[TELEMETRY] No inference telemetry available yet."
+
+        lines = ["Label | Avg Conf | Detections | Status"]
+        for row in labels:
+            label = str(row.get("label", "unknown"))
+            avg = float(row.get("avg_conf", 0.0))
+            detections = int(row.get("detections", 0))
+            status = str(row.get("status", "OK"))
+            if status.upper() == "WEAK":
+                status = "WEAK WARNING"
+            lines.append(f"{label} | {avg:.2f} | {detections} | {status}")
+        return "\n".join(lines)
+
+    def _run_benchmark_worker(self) -> None:
+        try:
+            results = run_quick_benchmark_suite()
+            passed = sum(1 for item in results if bool(item.get("passed")))
+            total = len(results)
+            self._enqueue_ui(
+                self._append_chat,
+                "assistant",
+                f"[BENCHMARK] Completed quick suite: {passed}/{total} passed.",
+            )
+        except Exception:
+            self._enqueue_ui(
+                self._append_chat,
+                "assistant",
+                f"[BENCHMARK] Failed:\n{traceback.format_exc()}",
+            )
+
+    def _router_status(self, message: str) -> None:
+        self._enqueue_ui(self._append_chat, "assistant", f"[ROUTER] {message}")
+
+    def _run_router_worker(self, command: str) -> None:
+        try:
+            if is_autopilot_enabled():
+                self._enqueue_ui(
+                    self._append_chat,
+                    "assistant",
+                    "[ROUTER] Command ignored while autopilot is active. Use /stop first.",
+                )
+                return
+
+            result = self._router.execute(command)
+            if result.success:
+                self._enqueue_ui(
+                    self._append_chat,
+                    "assistant",
+                    f"[ROUTER] {result.method} succeeded in {result.duration_ms:.1f}ms. {result.output}",
+                )
+                if result.method == "vision_fallback":
+                    set_goal(command)
+                    self._enqueue_ui(self._refresh_goal_label)
+            else:
+                self._enqueue_ui(
+                    self._append_chat,
+                    "assistant",
+                    f"[ROUTER] {result.method} failed in {result.duration_ms:.1f}ms: {result.error}",
+                )
+        except Exception:
+            self._enqueue_ui(
+                self._append_chat,
+                "assistant",
+                f"[ROUTER] Worker error:\n{traceback.format_exc()}",
+            )
+
+    @staticmethod
+    def _log_autopilot_error(trace_text: str) -> None:
+        logs_dir = Path("logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        date_tag = time.strftime("%Y-%m-%d")
+        out_path = logs_dir / f"errors_{date_tag}.log"
+        with out_path.open("a", encoding="utf-8") as handle:
+            handle.write(trace_text)
+            if not trace_text.endswith("\n"):
+                handle.write("\n")
 
     def _run_autopilot_worker(self) -> None:
         goal = (get_goal() or "").strip()
-        max_steps = get_max_steps()
+        max_steps = get_dynamic_max_steps()
         consecutive_failures = 0
+        executed_actions: list[str] = []
+        app_context_name = "unknown"
+        run_success = False
 
         enable_autopilot(step_limit=max_steps)
         self._enqueue_ui(self._append_chat, "assistant", f"[AUTO] Enabled. Goal: {goal}")
@@ -585,6 +703,7 @@ class AssistantChatWindow:
 
                 set_current_step(step)
                 prev_state = observe_state(max_width=1280)
+                app_context_name = getattr(prev_state.payload.app_context, "app_name", "unknown")
                 decision = decide_action(
                     state=prev_state,
                     goal=goal,
@@ -603,6 +722,7 @@ class AssistantChatWindow:
 
                 if action.action == ActionEnum.WAIT:
                     self._enqueue_ui(self._append_chat, "assistant", f"[AUTO] Step {step}: Completed.")
+                    run_success = True
                     break
 
                 if action.confidence_score < 0.4:
@@ -694,15 +814,16 @@ class AssistantChatWindow:
                             prev_image=candidate_prev_image,
                             new_image=next_image,
                             action=candidate_action,
+                            goal=goal,
                             prev_elements=candidate_prev_elements,
                         )
-                        if not success:
+                        if not success.success:
                             consecutive_failures += 1
                             candidate_success = False
                             self._enqueue_ui(
                                 self._append_chat,
                                 "assistant",
-                                f"[VERIFY] candidate #{idx}.{sub_idx} failed; trying next candidate.",
+                                f"[VERIFY] candidate #{idx}.{sub_idx} failed ({success.method}); trying next candidate.",
                             )
                             if consecutive_failures >= 2:
                                 break
@@ -710,11 +831,12 @@ class AssistantChatWindow:
 
                         consecutive_failures = 0
                         set_last_action(candidate_action)
+                        executed_actions.append(candidate_action.action.value)
                         candidate_prev_image = next_image
                         self._enqueue_ui(
                             self._append_chat,
                             "assistant",
-                            f"[VERIFY] Step {step}: success on candidate #{idx}.{sub_idx}",
+                            f"[VERIFY] Step {step}: success on candidate #{idx}.{sub_idx} ({success.method})",
                         )
 
                     if candidate_success:
@@ -818,15 +940,16 @@ class AssistantChatWindow:
                         prev_image=fallback_prev_image,
                         new_image=fallback_next_image,
                         action=fallback_action,
+                        goal=goal,
                         prev_elements=fallback_prev_elements,
                     )
-                    if not verified:
+                    if not verified.success:
                         consecutive_failures += 1
                         fallback_success = False
                         self._enqueue_ui(
                             self._append_chat,
                             "assistant",
-                            f"[VERIFY] fallback candidate #{sub_idx} failed.",
+                            f"[VERIFY] fallback candidate #{sub_idx} failed ({verified.method}).",
                         )
                         if consecutive_failures >= 2:
                             break
@@ -834,6 +957,7 @@ class AssistantChatWindow:
 
                     consecutive_failures = 0
                     set_last_action(fallback_action)
+                    executed_actions.append(fallback_action.action.value)
                     fallback_prev_image = fallback_next_image
 
                 if fallback_success:
@@ -864,9 +988,20 @@ class AssistantChatWindow:
                     "assistant",
                     f"[AUTO] Step limit reached ({max_steps}). Autopilot stopped.",
                 )
+                run_success = len(executed_actions) > 0 and consecutive_failures == 0
         except Exception:
-            self._enqueue_ui(self._append_chat, "assistant", f"[AUTO] Runtime error:\n{traceback.format_exc()}")
+            trace_text = traceback.format_exc()
+            self._log_autopilot_error(trace_text)
+            disable_autopilot()
+            self._enqueue_ui(self._append_chat, "assistant", f"[AUTO] Runtime error:\n{trace_text}")
         finally:
+            if run_success:
+                self._session_memory.add_task(
+                    goal=goal,
+                    actions=executed_actions,
+                    success=True,
+                    app_context=app_context_name,
+                )
             disable_autopilot()
             self._enqueue_ui(self._append_chat, "assistant", "[AUTO] Disabled.")
             self._step_lock.release()
