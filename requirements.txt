@@ -10,3 +10,7 @@ numpy>=1.26.0
 pytesseract>=0.3.10
 pyperclip>=1.8.2
 send2trash>=1.8.3
+customtkinter>=5.2.2
+pywinauto>=0.6.8
+pygetwindow>=0.0.9
+psutil>=5.9.8
